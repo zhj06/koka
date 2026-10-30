@@ -29,7 +29,13 @@ namespace Koka
         public string Kind, Path, Fingerprint;
         public long Size;
         public Candidate RemovalCandidate;
-    }    sealed class Candidate
+    }
+    sealed class WatchedDataPath
+    {
+        public string AppKey, Path;
+        public bool IsDirectory;
+    }
+    sealed class Candidate
     {
         public string Path, Key;
         public bool Registry, IsFile;
@@ -324,6 +330,10 @@ namespace Koka
         string lastRegistrySignature;
         readonly List<FileSystemWatcher> dataWatchers=new List<FileSystemWatcher>();
         System.Windows.Forms.Timer dataRescanTimer;
+        readonly HashSet<string> pendingDataChangeAppKeys=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        readonly object pendingDataChangeLock=new object();
+        volatile WatchedDataPath[] watchedDataPathIndex=new WatchedDataPath[0];
+        bool dataChangeDispatchPending;
         System.Threading.Timer registryPollTimer;
         int registryPollRunning;
         void ShowLoading(string text)
@@ -433,12 +443,11 @@ namespace Koka
                         countLabel.Text="读取软件列表失败，请点击刷新重试。";
                         return;
                     }
-                    inventory.Clear();inventory.AddRange(task.Result);if(restoreDataCache)dataCacheLoaded=false;
+                    inventory.Clear();inventory.AddRange(task.Result);watchedDataPathIndex=new WatchedDataPath[0];if(restoreDataCache)dataCacheLoaded=false;
                     inventory.Sort((a,b)=>String.Compare(a.Name,b.Name,StringComparison.CurrentCultureIgnoreCase));
                     appIcons.Images.Clear();
                     lastRegistrySignature=BuildInventorySignature();
 
-                    StartDataMonitoringAsync();
                     ShowApps();
                     if(!dataCacheLoaded){UpdateLoadingProgress(0,"软件清单已读取，正在载入本地缓存…");if(loadingBar!=null)loadingBar.IsIndeterminate=true;LoadDataCacheForDataTab();}else HideLoading();
                 });}
@@ -448,7 +457,7 @@ namespace Koka
         {
             if(dataCacheLoading||appsLoading)return;dataCacheLoading=true;int generation=dataChangeGeneration;dataTree.Enabled=false;
             if(startupLoading&&loadingForm!=null){loadingLabel.Text="正在载入本地缓存…";loadingBar.Value=0;loadingBar.IsIndeterminate=true;}
-            Task.Run(()=>ApplyDataCache()).ContinueWith(task=>{try{BeginInvoke((Action)delegate{dataCacheLoading=false;if(task.Status!=TaskStatus.RanToCompletion){dataCacheLoaded=true;dataCacheDirty=true;fullDataScanRequired=true;}if(generation!=dataChangeGeneration)dataCacheDirty=true;lastRegistrySignature=BuildInventorySignature();dataTree.Enabled=true;if(activeTab!=2)ShowApps();if(dataInventoryReloadPending&&!appsLoading){dataInventoryReloadPending=false;LoadApps();return;}ShowApps();bool silentStartupValidation=startupLoading&&!fullDataScanRequired;if(silentStartupValidation)HideLoading();countLabel.Text="已加载本地缓存，正在后台检查变化…";BeginInvoke((Action)delegate{if(!installedDataScanRunning&&!appsLoading)ValidateDataCache(silentStartupValidation);});});}catch{dataCacheLoading=false;}});
+            Task.Run(()=>ApplyDataCache()).ContinueWith(task=>{try{BeginInvoke((Action)delegate{dataCacheLoading=false;if(task.Status!=TaskStatus.RanToCompletion){dataCacheLoaded=true;dataCacheDirty=true;fullDataScanRequired=true;}if(generation!=dataChangeGeneration)dataCacheDirty=true;lastRegistrySignature=BuildInventorySignature();RebuildWatchedDataPathIndex();StartDataMonitoringAsync();dataTree.Enabled=true;if(activeTab!=2)ShowApps();if(dataInventoryReloadPending&&!appsLoading){dataInventoryReloadPending=false;LoadApps();return;}ShowApps();if(startupLoading&&fullDataScanRequired){countLabel.Text="本次启动已加载本地缓存；首次数据扫描请进入“数据”页后点击“扫描”。";HideLoading();return;}bool silentStartupValidation=startupLoading&&!fullDataScanRequired;if(silentStartupValidation)HideLoading();countLabel.Text="已加载本地缓存，正在后台检查变化…";BeginInvoke((Action)delegate{if(!installedDataScanRunning&&!appsLoading)ValidateDataCache(silentStartupValidation);});});}catch{dataCacheLoading=false;}});
         }        string CacheEncode(string value){return Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value??""));}
         string CacheDecode(string value){return System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(value??""));}
         string CacheAppSignature(AppInfo app){return String.Join("\n",new[]{app.Name??"",app.Version??"",app.Publisher??"",app.Location??"",app.IsInstalled.ToString()}.Concat(app.DataItems.Select(x=>String.Join("\t",new[]{x.Kind??"",x.Path??"",x.Size.ToString(),x.Fingerprint??"",x.RemovalCandidate==null?"":x.RemovalCandidate.Registry.ToString(),x.RemovalCandidate==null?"":x.RemovalCandidate.IsFile.ToString(),x.RemovalCandidate==null?"":x.RemovalCandidate.Key??""})).OrderBy(x=>x,StringComparer.OrdinalIgnoreCase)));}
@@ -473,7 +482,7 @@ namespace Koka
             // made startup time grow with cache rows multiplied by installed app count.
             var inventoryByKey=new Dictionary<string,AppInfo>(StringComparer.OrdinalIgnoreCase);
             foreach(AppInfo existing in inventory)if(!inventoryByKey.ContainsKey(AppKey(existing)))inventoryByKey.Add(AppKey(existing),existing);
-            try{foreach(string cacheFile in new[]{dataCachePath,dataCacheDeltaPath}){if(!File.Exists(cacheFile))continue;foreach(string line in File.ReadLines(cacheFile,System.Text.Encoding.UTF8)){string[] p=line.TrimStart('\uFEFF').Split('\t');if(p.Length==0)continue;if(p[0]=="R"&&p.Length>1){interruptedScan=String.Equals(p[1],"INCOMPLETE",StringComparison.OrdinalIgnoreCase);continue;}if(p[0]=="S"&&p.Length>1){storedSignature=CacheDecode(p[1]);continue;}if((p[0]=="P"||p[0]=="X")&&p.Length>1){string key=CacheDecode(p[1]);AppInfo prior;if(cachedApps.TryGetValue(key,out prior)){prior.DataItems.Clear();prior.Residues.Clear();}if(p[0]=="X"){cachedApps.Remove(key);previousInstalled.Remove(key);AppInfo stale;if(inventoryByKey.TryGetValue(key,out stale)&&!stale.IsInstalled)inventory.Remove(stale);inventoryByKey.Remove(key);}continue;}if(p[0]=="A"&&p.Length>=6){string key=CacheDecode(p[1]);AppInfo app;if(!inventoryByKey.TryGetValue(key,out app)){app=new AppInfo{Name=CacheDecode(p[2]),Version=CacheDecode(p[3]),Publisher=CacheDecode(p[4]),Location=CacheDecode(p[5]),IsInstalled=false};inventory.Add(app);inventoryByKey.Add(key,app);}app.Name=CacheDecode(p[2]);app.Version=CacheDecode(p[3]);app.Publisher=CacheDecode(p[4]);app.Location=CacheDecode(p[5]);app.IsInstalled=p.Length>6&&Boolean.Parse(p[6]);cachedApps[key]=app;previousInstalled[key]=app.IsInstalled;continue;}if(p[0]=="D"&&p.Length>=11){string key=CacheDecode(p[1]);AppInfo app;if(!cachedApps.TryGetValue(key,out app))continue;Candidate c=new Candidate{Path=CacheDecode(p[3]),Registry=Boolean.Parse(p[5]),IsFile=Boolean.Parse(p[6]),Hive=(RegistryHive)Int32.Parse(p[7]),View=(RegistryView)Int32.Parse(p[8]),Key=CacheDecode(p[9])};var item=new DataItem{Kind=CacheDecode(p[2]),Path=c.Path,Size=Int64.Parse(p[4]),RemovalCandidate=c,Fingerprint=CacheDecode(p[10])};app.DataItems.Add(item);app.Residues.Add(c);}}}}catch{dataCacheDirty=true;fullDataScanRequired=true;return;}
+             try{foreach(string cacheFile in new[]{dataCachePath,dataCacheDeltaPath}){if(!File.Exists(cacheFile))continue;foreach(string line in File.ReadLines(cacheFile,System.Text.Encoding.UTF8)){string[] p=line.TrimStart('\uFEFF').Split('\t');if(p.Length==0)continue;if(p[0]=="R"&&p.Length>1){interruptedScan=String.Equals(p[1],"INCOMPLETE",StringComparison.OrdinalIgnoreCase);continue;}if(p[0]=="S"&&p.Length>1){storedSignature=CacheDecode(p[1]);continue;}if((p[0]=="P"||p[0]=="X")&&p.Length>1){string key=CacheDecode(p[1]);AppInfo prior;if(cachedApps.TryGetValue(key,out prior)){prior.DataItems.Clear();prior.Residues.Clear();}if(p[0]=="X"){cachedApps.Remove(key);previousInstalled.Remove(key);AppInfo stale;if(inventoryByKey.TryGetValue(key,out stale)&&!stale.IsInstalled)inventory.Remove(stale);inventoryByKey.Remove(key);}continue;}if(p[0]=="A"&&p.Length>=6){string key=CacheDecode(p[1]);bool wasInstalled=p.Length>6&&Boolean.Parse(p[6]);AppInfo app;if(!inventoryByKey.TryGetValue(key,out app)){app=new AppInfo{Name=CacheDecode(p[2]),Version=CacheDecode(p[3]),Publisher=CacheDecode(p[4]),Location=CacheDecode(p[5]),IsInstalled=false};inventory.Add(app);inventoryByKey.Add(key,app);}bool installedNow=app.IsInstalled;app.Name=CacheDecode(p[2]);app.Version=CacheDecode(p[3]);app.Publisher=CacheDecode(p[4]);app.Location=CacheDecode(p[5]);app.IsInstalled=installedNow;cachedApps[key]=app;previousInstalled[key]=wasInstalled;continue;}if(p[0]=="D"&&p.Length>=11){string key=CacheDecode(p[1]);AppInfo app;if(!cachedApps.TryGetValue(key,out app))continue;Candidate c=new Candidate{Path=CacheDecode(p[3]),Registry=Boolean.Parse(p[5]),IsFile=Boolean.Parse(p[6]),Hive=(RegistryHive)Int32.Parse(p[7]),View=(RegistryView)Int32.Parse(p[8]),Key=CacheDecode(p[9])};var item=new DataItem{Kind=CacheDecode(p[2]),Path=c.Path,Size=Int64.Parse(p[4]),RemovalCandidate=c,Fingerprint=CacheDecode(p[10])};app.DataItems.Add(item);app.Residues.Add(c);}}}}catch{dataCacheDirty=true;fullDataScanRequired=true;return;}
             fullDataScanRequired=interruptedScan;dataCacheDirty=interruptedScan;cachedInventorySignature=storedSignature;
             foreach(AppInfo app in cachedApps.Values){if(app.DataItems.Count>0){app.SizeBytes=app.DataItems.Sum(x=>Math.Max(0,x.Size));app.HasKnownSize=true;app.SizeCalculationComplete=true;}else if(!app.IsInstalled){app.SizeBytes=0;app.HasKnownSize=true;app.SizeCalculationComplete=true;}string key=AppKey(app);bool wasInstalled;if(previousInstalled.TryGetValue(key,out wasInstalled)&&wasInstalled!=app.IsInstalled){changedDataAppKeys.Add(key);dataCacheDirty=true;}}
             foreach(AppInfo app in inventory.Where(a=>a.IsInstalled))if(!cachedApps.ContainsKey(AppKey(app))){changedDataAppKeys.Add(AppKey(app));dataCacheDirty=true;}
@@ -519,7 +528,7 @@ namespace Koka
         void StartDataMonitoringAsync()
         {
             if(dataMonitoringStarted)return;dataMonitoringStarted=true;dataMonitoringStopped=false;
-            dataRescanTimer=new System.Windows.Forms.Timer{Interval=1500};dataRescanTimer.Tick+=(s,e)=>{dataRescanTimer.Stop();if(dataCacheDirty&&activeTab==2)countLabel.Text="数据有变化；点击扫描以更新缓存。";};
+            dataRescanTimer=new System.Windows.Forms.Timer{Interval=1500};dataRescanTimer.Tick+=(s,e)=>{dataRescanTimer.Stop();FlushPendingDataChanges();if(dataCacheDirty&&activeTab==2)countLabel.Text="数据有变化；点击扫描以更新缓存。";};
             string[] roots={Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData)};
             registryPollTimer=new System.Threading.Timer(CheckRegistryChanges,null,20000,20000);
             Task.Run(()=>
@@ -550,17 +559,36 @@ namespace Koka
         void OnWatchedFileRename(object sender,RenamedEventArgs e){MarkDataChanged(e.FullPath);MarkDataChanged(e.OldFullPath);}
         void OnWatchedFileError(object sender,ErrorEventArgs e){MarkDataChanged(null);}
         bool IsDataCachePath(string path){if(String.IsNullOrWhiteSpace(path)||String.IsNullOrWhiteSpace(dataCachePath))return false;try{string full=Path.GetFullPath(path),cacheDirectory=Path.GetFullPath(Path.GetDirectoryName(dataCachePath));return IsPathWithin(full,cacheDirectory);}catch{return false;}}
+        void RebuildWatchedDataPathIndex()
+        {
+            var entries=new List<WatchedDataPath>();var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach(AppInfo app in inventory.Concat(archivedDataApps))foreach(DataItem item in app.DataItems)
+            {
+                Candidate candidate=item.RemovalCandidate;if(candidate==null||candidate.Registry||String.IsNullOrWhiteSpace(item.Path))continue;
+                try{string path=Path.GetFullPath(item.Path),key=AppKey(app),identity=key+"\n"+path+"\n"+candidate.IsFile;if(seen.Add(identity))entries.Add(new WatchedDataPath{AppKey=key,Path=path,IsDirectory=!candidate.IsFile});}catch{}
+            }
+            watchedDataPathIndex=entries.ToArray();
+        }
+        void FlushPendingDataChanges()
+        {
+            string[] keys;lock(pendingDataChangeLock){keys=pendingDataChangeAppKeys.ToArray();pendingDataChangeAppKeys.Clear();dataChangeDispatchPending=false;}
+            if(keys.Length==0)return;foreach(string key in keys)changedDataAppKeys.Add(key);dataCacheDirty=true;dataChangeGeneration++;
+        }
         void MarkDataChanged(string path)
         {
             try
             {
-                if(IsDisposed||!IsHandleCreated||IsDataCachePath(path))return;
-                BeginInvoke((Action)delegate
+                if(IsDisposed||!IsHandleCreated||String.IsNullOrWhiteSpace(path)||IsDataCachePath(path))return;
+                string fullPath;try{fullPath=Path.GetFullPath(path);}catch{return;}
+                var matchedKeys=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach(WatchedDataPath item in watchedDataPathIndex)
                 {
-                    dataCacheDirty=true;
-                    dataChangeGeneration++;
-                    if(activeTab==2)countLabel.Text="数据已发生变化；点击扫描以更新缓存。";
-                });
+                    if(String.Equals(fullPath,item.Path,StringComparison.OrdinalIgnoreCase)||(item.IsDirectory&&IsPathWithin(fullPath,item.Path)))matchedKeys.Add(item.AppKey);
+                }
+                if(matchedKeys.Count==0)return;
+                bool dispatch=false;lock(pendingDataChangeLock){foreach(string key in matchedKeys)pendingDataChangeAppKeys.Add(key);if(!dataChangeDispatchPending){dataChangeDispatchPending=true;dispatch=true;}}
+                if(!dispatch)return;
+                BeginInvoke((Action)delegate{if(dataMonitoringStopped||IsDisposed){lock(pendingDataChangeLock)dataChangeDispatchPending=false;return;}if(dataRescanTimer!=null){dataRescanTimer.Stop();dataRescanTimer.Start();}});
             }
             catch{}
         }
@@ -654,7 +682,7 @@ namespace Koka
         void ShowApps()
         {
             if(appsLoading)return;
-            software.Visible=activeTab==0||activeTab==1;stateFilterBox.Visible=activeTab==0;scanDataButton.Visible=activeTab==2;dataTree.Visible=activeTab==2;systemFiles.Visible=activeTab==3;
+            software.Visible=activeTab==0||activeTab==1;software.MultiSelect=activeTab==0;stateFilterBox.Visible=activeTab==0;scanDataButton.Visible=activeTab==2;dataTree.Visible=activeTab==2;systemFiles.Visible=activeTab==3;
             if(activeTab==2){if(!dataCacheLoaded){if(!dataCacheLoading)LoadDataCacheForDataTab();return;}RenderDataTree();UpdateCountLabel();if(dataCacheValidationComplete&&!dataCacheDirty)countLabel.Text+=" · 缓存扫描已完成";return;}
             if(activeTab==3){RenderSystemFiles();if(systemInventory.Count==0&&!systemScanRunning)LoadSystemFiles();else if(!systemScanRunning)countLabel.Text="系统文件和驱动文件："+systemInventory.Count+" 个";return;}
             software.BeginUpdate(); software.Items.Clear(); string q=filterIsPlaceholder?"":filter.Text.Trim();
@@ -823,17 +851,19 @@ namespace Koka
             if(e.Button!=MouseButtons.Right)return;
             ListViewItem row=software.GetItemAt(e.X,e.Y);
             if(row==null)return;
-            row.Selected=true; row.Focused=true;
+            if(!row.Selected){if((ModifierKeys&Keys.Control)!=Keys.Control)software.SelectedItems.Clear();row.Selected=true;}row.Focused=true;
             appMenu.Show(software,e.Location);
         }
         void AppMenuOpening(object sender, System.ComponentModel.CancelEventArgs e)
         {
-            uninstallMenu.Enabled=current!=null&&current.IsInstalled;
-            openLocationMenu.Enabled=current!=null&&current.IsInstalled&&!String.IsNullOrEmpty(GetInstallFolder(current));
-            detailsMenu.Enabled=current!=null;
-            cleanResiduesMenu.Enabled=current!=null&&!current.IsInstalled&&current.Residues.Count>0;
-            viewResiduesMenu.Enabled=current!=null&&!current.IsInstalled&&current.Residues.Count>0;
-            forceRemoveMenu.Enabled=current!=null;
+            bool multiple=software.SelectedItems.Count>1;List<AppInfo> selected=software.SelectedItems.Cast<ListViewItem>().Select(row=>row.Tag as AppInfo).Where(app=>app!=null).ToList();bool allResiduals=activeTab==0&&selected.Count>1&&selected.All(app=>!app.IsInstalled&&app.Residues.Count>0);
+            uninstallMenu.Enabled=!multiple&&current!=null&&current.IsInstalled;
+            openLocationMenu.Enabled=!multiple&&current!=null&&current.IsInstalled&&!String.IsNullOrEmpty(GetInstallFolder(current));
+            detailsMenu.Enabled=!multiple&&current!=null;
+            cleanResiduesMenu.Text=multiple?"批量删除残留":"清理残留";
+            cleanResiduesMenu.Enabled=multiple?allResiduals:current!=null&&!current.IsInstalled&&current.Residues.Count>0;
+            viewResiduesMenu.Enabled=!multiple&&current!=null&&!current.IsInstalled&&current.Residues.Count>0;
+            forceRemoveMenu.Enabled=!multiple&&current!=null;
         }
         void ShowAppDetails(object sender,EventArgs e)
         {
@@ -881,6 +911,7 @@ namespace Koka
         }
         void Uninstall(object sender, EventArgs e)
         {
+            if(software.SelectedItems.Count!=1)return;
             if(installedDataScanRunning)return;
             if(current==null||MessageBox.Show("将启动“"+current.Name+"”登记的卸载程序。继续吗？","确认卸载",MessageBoxButtons.YesNo,MessageBoxIcon.Question)!=DialogResult.Yes)return;
             AppInfo uninstalling=current;ShowLoading("正在记录软件安装文件，以便显示卸载删除记录…");
@@ -942,7 +973,7 @@ namespace Koka
             installedDataScanRunning=true;dataTree.Enabled=true;if(!silent)ShowLoading(full?"正在扫描软件数据…":"正在增量扫描有变化的软件数据…");else countLabel.Text="正在后台静默更新数据缓存…";var cancellation=new CancellationTokenSource();dataScanCancellation=cancellation;
             Task.Run(()=>{if(full)ScanInstalledData(apps,scanInventory,cancellation.Token);else ScanChangedApps(apps,cancellation.Token);return scanInventory;},cancellation.Token).ContinueWith(task=>{try{BeginInvoke((Action)delegate{
                 if(task.IsCanceled||task.Status!=TaskStatus.RanToCompletion){FinishInstalledDataScan(cancellation,task.IsCanceled,task.IsCanceled?null:"数据扫描失败，请点击扫描重试。",null,silent);return;}
-                inventory.Clear();inventory.AddRange(task.Result);bool current=scanGeneration==dataChangeGeneration;cachedInventorySignature=BuildInventorySignature();
+                inventory.Clear();inventory.AddRange(task.Result);RebuildWatchedDataPathIndex();bool current=scanGeneration==dataChangeGeneration;cachedInventorySignature=BuildInventorySignature();
                 if(current){dataCacheDirty=false;fullDataScanRequired=false;changedDataAppKeys.Clear();installedDataScanComplete=true;}
                 else{dataCacheDirty=true;fullDataScanRequired=false;installedDataScanComplete=false;}
                 finalCacheWriteRunning=true;if(!silent)ReplaceLoading("扫描完成，准备写入缓存…");UpdateLoadingProgress(0,"正在准备缓存指纹…");Task.Run(()=>{RefreshDataFingerprints((done,total)=>UpdateLoadingProgress(total==0?600:(int)(done*600L/total),"正在刷新缓存指纹（"+done+" / "+total+"）…"));UpdateLoadingProgress(650,"指纹刷新完成，正在写入缓存…");return SaveDataCache((value,text)=>UpdateLoadingProgress(value,text));}).ContinueWith(save=>{try{BeginInvoke((Action)delegate{FinishInstalledDataScan(cancellation,false,save.Status==TaskStatus.RanToCompletion&&save.Result?null:"缓存写入失败，扫描结果已显示；请点击扫描重试。",save.Status==TaskStatus.RanToCompletion&&save.Result,silent);});}catch{}});
@@ -1174,7 +1205,45 @@ namespace Koka
             var candidate=new Candidate{Path=path};if(String.Equals(kind,"注册表项",StringComparison.OrdinalIgnoreCase)){candidate.Registry=true;try{int slash=path.IndexOf('\\');int bracket=path.LastIndexOf(" [",StringComparison.Ordinal);string hive=slash>0?path.Substring(0,slash):"";string key=slash>0?path.Substring(slash+1,bracket>slash?bracket-slash-1:path.Length-slash-1):"";if(bracket>0){string view=path.Substring(bracket+2).TrimEnd(']');candidate.View=view=="Registry32"?RegistryView.Registry32:RegistryView.Registry64;}candidate.Hive=hive=="CurrentUser"?RegistryHive.CurrentUser:hive=="ClassesRoot"?RegistryHive.ClassesRoot:hive=="Users"?RegistryHive.Users:hive=="CurrentConfig"?RegistryHive.CurrentConfig:RegistryHive.LocalMachine;candidate.Key=key;}catch{}return candidate;}candidate.IsFile=String.Equals(kind,"文件",StringComparison.OrdinalIgnoreCase)||(!String.Equals(kind,"残留文件夹",StringComparison.OrdinalIgnoreCase)&&!String.Equals(kind,"子文件夹",StringComparison.OrdinalIgnoreCase)&&!String.IsNullOrEmpty(Path.GetExtension(path)));return candidate;
         }        void CleanCurrentResidues(object sender, EventArgs e)
         {
+            if(software.SelectedItems.Count>1){DeleteSelectedResidues();return;}
             if(current==null||current.IsInstalled)return;ScanAfterUninstall(current);
+        }
+        void DeleteSelectedResidues()
+        {
+            List<AppInfo> targets=software.SelectedItems.Cast<ListViewItem>().Select(row=>row.Tag as AppInfo).Where(app=>app!=null).ToList();
+            if(activeTab!=0||targets.Count<2||targets.Any(app=>app.IsInstalled||app.Residues.Count==0)||installedDataScanRunning)return;
+            int candidateCount=targets.Sum(app=>app.Residues.Count);string names=String.Join("、",targets.Select(app=>app.Name).ToArray());
+            string prompt="将批量删除以下 "+targets.Count+" 个已卸载软件的 "+candidateCount+" 项残留：\r\n"+names+"\r\n\r\n文件和文件夹将永久删除；注册表项会先备份。确定继续吗？";
+            if(MessageBox.Show(prompt,"确认批量删除残留",MessageBoxButtons.YesNo,MessageBoxIcon.Warning)!=DialogResult.Yes)return;
+            var cacheBaseline=inventory.Concat(archivedDataApps).GroupBy(AppKey,StringComparer.OrdinalIgnoreCase).ToDictionary(group=>group.Key,group=>CacheAppSignature(group.First()),StringComparer.OrdinalIgnoreCase);
+            ShowLoading("正在批量删除所选软件残留…");
+            Task.Run(()=>
+            {
+                var results=new List<Tuple<AppInfo,CleanupReport>>();
+                for(int i=0;i<targets.Count;i++)
+                {
+                    AppInfo app=targets[i];var candidates=new List<Candidate>(app.Residues);
+                    CleanupReport result=CleanAndRescan(app,candidates,false,(path,done,total)=>{int itemProgress=total==0?0:(int)(done*1000L/total);int value=(i*1000+itemProgress)/targets.Count;UpdateLoadingProgress(value,"正在清理 "+app.Name+"："+path);});
+                    results.Add(Tuple.Create(app,result));
+                }
+                return results;
+            }).ContinueWith(task=>
+            {
+                try{BeginInvoke((Action)delegate
+                {
+                    if(task.Status!=TaskStatus.RanToCompletion){HideLoading();MessageBox.Show("批量删除过程未完成，请重新扫描核对。","删除失败",MessageBoxButtons.OK,MessageBoxIcon.Error);return;}
+                    int deleted=0,remainingFiles=0,remainingFolders=0,remainingRegistry=0;var errors=new List<string>();
+                    foreach(var pair in task.Result)
+                    {
+                        AppInfo app=pair.Item1;CleanupReport result=pair.Item2;ResidueReport left=result.RemainingSummary??new ResidueReport();deleted+=result.DeletedItems.Count;remainingFiles+=left.FileCount;remainingFolders+=left.FolderCount;remainingRegistry+=left.RegistryCount;
+                        app.Residues=result.Remaining;app.DataItems=left.Entries.Select(CreateDataItem).ToList();app.SizeBytes=left.TotalSizeBytes;app.HasKnownSize=left.Complete;app.SizeCalculationComplete=true;
+                        if(result.Remaining.Count==0&&!app.IsInstalled){inventory.Remove(app);archivedDataApps.RemoveAll(a=>AppKey(a)==AppKey(app));}
+                        if(!String.IsNullOrEmpty(result.Errors))errors.Add(app.Name+"：\r\n"+result.Errors);
+                    }
+                    pendingCacheBaseline.Clear();foreach(var entry in cacheBaseline)pendingCacheBaseline[entry.Key]=entry.Value;RebuildWatchedDataPathIndex();ShowApps();UpdateCountLabel();
+                    Task.Run(()=>SaveDataCache()).ContinueWith(save=>{try{BeginInvoke((Action)delegate{HideLoading();string text="本次已记录删除位置："+deleted+" 项。\r\n删除后仍有："+remainingFiles+" 个文件、"+remainingFolders+" 个文件夹、"+remainingRegistry+" 个注册表项。";if(save.Status!=TaskStatus.RanToCompletion||!save.Result)text+="\r\n\r\n缓存写入失败，重新启动后可能需要再次扫描。";if(errors.Count>0)text+="\r\n\r\n未能处理：\r\n"+String.Join("\r\n",errors.ToArray());MessageBox.Show(text,"批量清理结果",MessageBoxButtons.OK,MessageBoxIcon.Warning);});}catch{HideLoading();}});
+                });}catch{HideLoading();}
+            });
         }
         void RecordDeleteHistory(string appName,string path,string result)
         {
@@ -1239,7 +1308,7 @@ namespace Koka
                     if(c.Registry)
                     {
                         Directory.CreateDirectory(backup);string hiveName=c.Hive==RegistryHive.CurrentUser?"HKEY_CURRENT_USER":"HKEY_LOCAL_MACHINE";string regPath=hiveName+"\\"+c.Key;
-                        if(c.View==RegistryView.Registry32&&c.Key.StartsWith("SOFTWARE\\",StringComparison.OrdinalIgnoreCase))regPath=hiveName+"\\SOFTWARE\\WOW6432Node\\"+c.Key.Substring(8);
+                        if(c.Hive==RegistryHive.LocalMachine&&c.View==RegistryView.Registry32&&c.Key.StartsWith("SOFTWARE\\",StringComparison.OrdinalIgnoreCase))regPath=hiveName+"\\SOFTWARE\\WOW6432Node\\"+c.Key.Substring("SOFTWARE\\".Length);
                         string file=Path.Combine(backup,Regex.Replace(c.Hive+"-"+c.Key+"-"+c.View,"[^A-Za-z0-9._-]","_")+".reg");
                         using(var p=Process.Start(new ProcessStartInfo{FileName="reg.exe",Arguments="export \""+regPath+"\" \""+file+"\" /y",UseShellExecute=false,CreateNoWindow=true,RedirectStandardError=true})){p.WaitForExit();if(p.ExitCode!=0||!File.Exists(file))throw new Exception("注册表备份失败："+p.StandardError.ReadToEnd());}
                         using(var baseKey=RegistryKey.OpenBaseKey(c.Hive,c.View))baseKey.DeleteSubKeyTree(c.Key);
